@@ -3,25 +3,22 @@
 layout(binding = 0) uniform sampler2D s_gAlbedo;
 layout(binding = 1) uniform sampler2D s_gNormal;
 layout(binding = 2) uniform sampler2D s_gDepth;
-layout(binding = 3) uniform sampler2D s_rsmIndirect;
-layout(binding = 4) uniform sampler2D s_rsmDepthShadow;
+layout(binding = 3) uniform sampler2D s_shadowDepth;
 
 layout(location = 0) in vec2 v_uv;
 
 layout(location = 0) out vec3 o_color;
 
-layout(binding = 0, std140) uniform GlobalUniforms
+layout(binding = 0, std140) uniform FrameUniforms
 {
   mat4 viewProj;
   mat4 invViewProj;
-};
-
-layout(binding = 1, std140) uniform ShadingUniforms
-{
   mat4 sunViewProj;
-  vec4 sunDir;
-  vec4 sunStrength;
-}shadingUniforms;
+  vec3 sunDir;
+  vec3 sunIntensity;
+  vec3 cameraPos;
+  ivec2 resolution;
+};
 
 vec3 UnprojectUV(float depth, vec2 uv, mat4 invXProj)
 {
@@ -29,6 +26,16 @@ vec3 UnprojectUV(float depth, vec2 uv, mat4 invXProj)
   vec4 ndc = vec4(uv * 2.0 - 1.0, z, 1.0);
   vec4 world = invXProj * ndc;
   return world.xyz / world.w;
+}
+
+float hash(vec2 n)
+{ 
+  return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453);
+}
+
+vec2 Hammersley(uint i, uint N)
+{
+  return vec2(float(i) / float(N), float(bitfieldReverse(i)) * 2.3283064365386963e-10);
 }
 
 float Shadow(vec4 clip, vec3 normal, vec3 lightDir)
@@ -39,27 +46,37 @@ float Shadow(vec4 clip, vec3 normal, vec3 lightDir)
     return 0;
   }
 
-  float viewDepth = clip.z * .5 + .5;
-  float lightDepth = textureLod(s_rsmDepthShadow, uv, 0).x;
-
   // Analytically compute slope-scaled bias
-  const float maxBias = 0.0018;
+  const float maxBias = 0.0008;
   const float quantize = 2.0 / (1 << 23);
-  ivec2 res = textureSize(s_rsmDepthShadow, 0);
+  ivec2 res = textureSize(s_shadowDepth, 0);
   float b = 1.0 / max(res.x, res.y) / 2.0;
-  float NoD = clamp(-dot(shadingUniforms.sunDir.xyz, normal), 0.0, 1.0);
-  float bias = quantize + b * length(cross(-shadingUniforms.sunDir.xyz, normal)) / NoD;
+  float NoD = clamp(-dot(sunDir.xyz, normal), 0.0, 1.0);
+  float bias = quantize + b * length(cross(-sunDir.xyz, normal)) / NoD;
   bias = min(bias, maxBias);
 
-  lightDepth += bias;
-  
   float lightOcclusion = 0.0;
-  if (lightDepth >= viewDepth)
+
+  const int SAMPLES = 4;
+  for (int i = 0; i < SAMPLES; i++)
   {
-    lightOcclusion += 1.0;
+    float viewDepth = clip.z * .5 + .5;
+
+    vec2 xi = fract(Hammersley(i, SAMPLES) + hash(gl_FragCoord.xy));
+    float r = xi.x;
+    float theta = xi.y * 2.0 * 3.14159;
+    vec2 offset = 0.002 * vec2(r * cos(theta), r * sin(theta));
+    float lightDepth = textureLod(s_shadowDepth, uv + offset, 0).x;
+
+    lightDepth += bias;
+    
+    if (lightDepth >= viewDepth)
+    {
+      lightOcclusion += 1.0;
+    }
   }
 
-  return lightOcclusion;
+  return lightOcclusion / SAMPLES;
 }
 
 void main()
@@ -70,22 +87,19 @@ void main()
 
   if (depth == 1.0)
   {
-    o_color = albedo;
+    o_color = vec3(0);
     return;
   }
 
   vec3 worldPos = UnprojectUV(depth, v_uv, invViewProj);
   
-  vec3 incidentDir = -shadingUniforms.sunDir.xyz;
+  vec3 incidentDir = -sunDir.xyz;
   float cosTheta = max(0.0, dot(incidentDir, normal));
-  vec3 diffuse = albedo * cosTheta * shadingUniforms.sunStrength.rgb;
-  diffuse *= Shadow(shadingUniforms.sunViewProj * vec4(worldPos, 1.0), normal, shadingUniforms.sunDir.xyz);
+  vec3 diffuse = albedo * cosTheta * sunIntensity.rgb;
+  diffuse *= Shadow(sunViewProj * vec4(worldPos, 1.0), normal, sunDir.xyz);
 
-  //vec3 ambient = vec3(.03) * albedo;
-  vec3 ambient = textureLod(s_rsmIndirect, v_uv, 0).rgb;
+  vec3 ambient = vec3(1.03) * albedo;
   vec3 finalColor = diffuse + ambient;
 
-  // tone mapping (optional)
-  //finalColor = finalColor / (1.0 + finalColor);
   o_color = finalColor;
 }
